@@ -1,0 +1,57 @@
+{
+  "description": "Маршрутизація Vision-моделей. Файл перечитується автоматично в рантаймі (hot-reload) при кожній зміні без перезапуску процесу.",
+  "cooldown_seconds_on_failure": 60,
+  "max_attempts_per_model": 2,
+  "routes": [
+    {
+      "name": "gemini_primary",
+      "provider": "gemini",
+      "model": "models/gemini-flash-lite-latest",
+      "api_key_env": "GEMINI_API_KEY",
+      "enabled": true,
+      "timeout_seconds": 30
+    },
+    {
+      "name": "gemini_backup_3_5_lite",
+      "provider": "gemini",
+      "model": "models/gemini-3.5-flash-lite",
+      "api_key_env": "GEMINI_API_KEY",
+      "enabled": true,
+      "timeout_seconds": 30
+    },
+    {
+      "name": "gemini_backup_3_1_lite",
+      "provider": "gemini",
+      "model": "models/gemini-3.1-flash-lite",
+      "api_key_env": "GEMINI_API_KEY",
+      "enabled": true,
+      "timeout_seconds": 30
+    },
+    {
+      "name": "openai_gpt4o_mini",
+      "provider": "openai",
+      "model": "gpt-4o-mini",
+      "api_key_env": "OPENAI_API_KEY",
+      "base_url": "https://api.openai.com/v1",
+      "enabled": true,
+      "timeout_seconds": 35
+    },
+    {
+      "name": "anthropic_claude_haiku",
+      "provider": "anthropic",
+      "model": "claude-3-5-haiku-latest",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "enabled": true,
+      "timeout_seconds": 40
+    },
+    {
+      "name": "openrouter_universal",
+      "provider": "openai_compatible",
+      "model": "google/gemini-2.5-flash-lite",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "base_url": "https://openrouter.ai/api/v1",
+      "enabled": true,
+      "timeout_seconds": 35
+    }
+  ]
+}

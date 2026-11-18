@@ -1,0 +1,32 @@
+# Secrets & local configs
+.env
+.env.*
+!.env.example
+
+# Messenger sessions & local databases
+*.session
+*.session-journal
+*.db
+*.sqlite
+*.sqlite3
+sessions/
+waha_sessions/
+
+# Runtime storage & logs
+storage/
+logs/
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node.js / TypeScript
+node_modules/
+dist/
+
+# OS / IDE
+.DS_Store
+Thumbs.db

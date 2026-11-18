@@ -1,0 +1,17 @@
+[project]
+name = "ramedas-reports-agent"
+version = "0.1.0"
+description = "Автоматизація збору та класифікації фотозвітності харчоблоків ТОВ «Рамедас Україна» (Viber / Telegram / WhatsApp)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+    "pydantic>=2.9.0",
+    "python-dotenv>=1.0.1",
+    "rapidfuzz>=3.9.0",
+    "watchdog>=5.0.0",
+    "pillow>=10.4.0",
+]
+
+[project.scripts]
+ramedas-agent = "src.main:main"
