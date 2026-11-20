@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
 import json
 import os
 from pathlib import Path
@@ -94,7 +95,14 @@ class VisionModelRouter:
         self.active_providers = providers
         return True
 
-    def analyze_image(self, image_path: Path, caption: str | None = None) -> VisionAnalysisResult:
+    def analyze_image(
+        self,
+        image_path: Path,
+        caption: str | None = None,
+        *,
+        rotation_degrees: int = 0,
+        reference_date: date | datetime | None = None,
+    ) -> VisionAnalysisResult:
         """
         Виконує аналіз фото з автоматичним перебором ланцюжка моделей (Primary -> Backup 1 -> Backup 2).
         Якщо модель повертає 429/503/помилку — переводить її в cooldown і миттєво бере наступну.
@@ -113,14 +121,27 @@ class VisionModelRouter:
         # Спочатку пробуємо провайдери, які не знаходяться в cooldown
         available = [p for p in self.active_providers if self._cooldown_until.get(p.name, 0.0) <= now]
         if not available:
-            # Якщо всі моделі потрапили в cooldown — скидаємо таймер для першої та робимо паузу
-            available = list(self.active_providers)
+            # Якщо всі моделі потрапили в cooldown — чекаємо до найближчого розблокування (макс. 15с)
+            soonest = min(self._cooldown_until.get(p.name, now) for p in self.active_providers)
+            wait_s = max(1.0, min(soonest - now, 15.0))
+            logger.warning("Усі LLM-провайдери в cooldown — пауза %.1fс до найближчої спроби", wait_s)
+            time.sleep(wait_s)
+            available = sorted(
+                self.active_providers,
+                key=lambda p: self._cooldown_until.get(p.name, 0.0),
+            )
 
         errors: list[str] = []
         for provider in available:
             for attempt in range(1, self.max_attempts_per_model + 1):
                 try:
-                    result = provider.analyze(image_path, self.system_prompt, caption=caption)
+                    result = provider.analyze(
+                        image_path,
+                        self.system_prompt,
+                        caption=caption,
+                        rotation_degrees=rotation_degrees,
+                        reference_date=reference_date,
+                    )
                     self.last_used_route = f"{provider.provider_type}:{provider.model}"
                     return result
                 except Exception as exc:

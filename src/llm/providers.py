@@ -1,20 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-import base64
-import mimetypes
+from datetime import date, datetime
 from pathlib import Path
 import httpx
 
+from src.image_utils import encode_image_for_llm
 from src.llm.prompts import build_user_prompt, extract_json_object
 from src.models import VisionAnalysisResult
-
-
-def _encode_image(image_path: Path) -> tuple[str, str]:
-    mime_type, _ = mimetypes.guess_type(str(image_path))
-    mime_type = mime_type or "image/jpeg"
-    encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
-    return mime_type, encoded
 
 
 class BaseVisionProvider(ABC):
@@ -41,6 +34,9 @@ class BaseVisionProvider(ABC):
         image_path: Path,
         system_prompt: str,
         caption: str | None = None,
+        *,
+        rotation_degrees: int = 0,
+        reference_date: date | datetime | None = None,
     ) -> VisionAnalysisResult:
         raise NotImplementedError
 
@@ -51,12 +47,18 @@ class GeminiVisionProvider(BaseVisionProvider):
         image_path: Path,
         system_prompt: str,
         caption: str | None = None,
+        *,
+        rotation_degrees: int = 0,
+        reference_date: date | datetime | None = None,
     ) -> VisionAnalysisResult:
         model_path = self.model if self.model.startswith("models/") else f"models/{self.model}"
         base = (self.base_url or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
         endpoint = f"{base}/{model_path}:generateContent"
 
-        mime_type, b64_data = _encode_image(image_path)
+        mime_type, b64_data = encode_image_for_llm(
+            image_path, rotation_degrees=rotation_degrees
+        )
+        user_prompt = build_user_prompt(caption, reference_date=reference_date)
         payload = {
             "system_instruction": {"parts": [{"text": system_prompt}]},
             "contents": [
@@ -64,7 +66,7 @@ class GeminiVisionProvider(BaseVisionProvider):
                     "role": "user",
                     "parts": [
                         {"inline_data": {"mime_type": mime_type, "data": b64_data}},
-                        {"text": build_user_prompt(caption)},
+                        {"text": user_prompt},
                     ],
                 }
             ],
@@ -96,12 +98,18 @@ class OpenAICompatibleVisionProvider(BaseVisionProvider):
         image_path: Path,
         system_prompt: str,
         caption: str | None = None,
+        *,
+        rotation_degrees: int = 0,
+        reference_date: date | datetime | None = None,
     ) -> VisionAnalysisResult:
         base = (self.base_url or "https://api.openai.com/v1").rstrip("/")
         endpoint = f"{base}/chat/completions"
 
-        mime_type, b64_data = _encode_image(image_path)
+        mime_type, b64_data = encode_image_for_llm(
+            image_path, rotation_degrees=rotation_degrees
+        )
         data_uri = f"data:{mime_type};base64,{b64_data}"
+        user_prompt = build_user_prompt(caption, reference_date=reference_date)
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -116,7 +124,7 @@ class OpenAICompatibleVisionProvider(BaseVisionProvider):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": build_user_prompt(caption)},
+                        {"type": "text", "text": user_prompt},
                         {"type": "image_url", "image_url": {"url": data_uri}},
                     ],
                 },
@@ -138,11 +146,17 @@ class AnthropicVisionProvider(BaseVisionProvider):
         image_path: Path,
         system_prompt: str,
         caption: str | None = None,
+        *,
+        rotation_degrees: int = 0,
+        reference_date: date | datetime | None = None,
     ) -> VisionAnalysisResult:
         base = (self.base_url or "https://api.anthropic.com/v1").rstrip("/")
         endpoint = f"{base}/messages"
 
-        mime_type, b64_data = _encode_image(image_path)
+        mime_type, b64_data = encode_image_for_llm(
+            image_path, rotation_degrees=rotation_degrees
+        )
+        user_prompt = build_user_prompt(caption, reference_date=reference_date)
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -165,7 +179,7 @@ class AnthropicVisionProvider(BaseVisionProvider):
                                 "data": b64_data,
                             },
                         },
-                        {"type": "text", "text": build_user_prompt(caption)},
+                        {"type": "text", "text": user_prompt},
                     ],
                 }
             ],

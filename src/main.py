@@ -5,98 +5,279 @@ import sys
 import time
 
 from src.config import Settings
-from src.connectors.viber_local import group_into_burst_batches
 from src.logger import LOG_FILE, get_logger
+from src.models import IncomingMediaItem
 from src.pipeline import ReportPipeline
 
 log = get_logger("main")
 
 
-def main() -> int:
-    if hasattr(sys.stdout, "reconfigure"):
-        sys.stdout.reconfigure(encoding="utf-8")
-
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ramedas Reports Agent")
     parser.add_argument("--status", action="store_true", help="Показати поточний стан і чергу")
     parser.add_argument("--once", action="store_true", help="Обробити поточну чергу фото")
     parser.add_argument("--limit", type=int, default=0, help="Ліміт фото за один прогін")
     parser.add_argument("--dry-run", action="store_true", help="Тестовий прогін без запису")
     parser.add_argument("--watch", action="store_true", help="Фоновий моніторинг")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--rotate-old",
+        action="store_true",
+        help="Очистити або заархівувати старі оброблені файли з ViberDownloads",
+    )
+    parser.add_argument(
+        "--retention-days",
+        type=int,
+        default=None,
+        help="Поріг давності файлів у днях для ротації ViberDownloads (перевизначає VIBER_RETENTION_DAYS)",
+    )
+    parser.add_argument(
+        "--activity-stats",
+        action="store_true",
+        help="Показати статистику активності по годинах доби та громадах із state.db",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=14,
+        help="Кількість днів для --activity-stats (за замовчуванням 14)",
+    )
+    parser.add_argument(
+        "--test-alert",
+        action="store_true",
+        help="Надіслати тестовий технічний алерт (у Telegram або в локальний лог, якщо бот не підключений)",
+    )
+    parser.add_argument(
+        "--telegram-login",
+        action="store_true",
+        help="Одноразова авторизація робочого акаунта Telegram (User API / Telethon)",
+    )
+    parser.add_argument(
+        "--telegram-chats",
+        action="store_true",
+        help="Показати список груп Telegram та їхні ID (для TELEGRAM_ALLOWED_CHATS)",
+    )
+    return parser
 
+
+def _print_activity_stats(pipeline: ReportPipeline, settings: Settings, days: int) -> None:
+    act = pipeline.storage.get_activity_stats(
+        days=days,
+        work_start_hour=pipeline.monitor.work_start.hour,
+        work_end_hour=pipeline.monitor.work_end.hour,
+    )
+    print(f"Статистика активності за останні {act['days']} дн.:")
+    print(f"  total_files      : {act['total_count']}")
+    print(
+        f"  work_hours       : {act['work_hours_count']} "
+        f"({settings.work_hours_start}-{settings.work_hours_end})"
+    )
+    print(f"  today_files      : {act['today_count']}")
+    print(f"  last_arrival     : {act['last_arrival'] or 'none'}")
+    print("  by_hour (00..23) :")
+    for hour, cnt in act["hourly_counts"].items():
+        if cnt > 0:
+            print(f"    {hour:02d}:00 | {cnt:4d} {'#' * min(30, cnt)}")
+    if act["by_region"]:
+        print("  by_region        :")
+        for reg in act["by_region"]:
+            print(
+                f"    - {reg['region']}: {reg['count']} фото "
+                f"(пік {reg['peak_hour']:02d}:00, останній {reg['last_arrival']})"
+            )
+    recent_alerts = pipeline.storage.get_recent_alerts(limit=5)
+    if recent_alerts:
+        print("  recent_alerts    :")
+        for al in recent_alerts:
+            tg_flag = "tg" if al["delivered_telegram"] else "local"
+            print(
+                f"    [{al['created_at']}] ({al['severity']}/{tg_flag}) "
+                f"{al['alert_key']}: {al['message'][:80]}"
+            )
+
+
+def _print_status(pipeline: ReportPipeline, settings: Settings, *, viber_alive: bool) -> None:
+    pending, batches = pipeline.fetch_pending_batches()
+    stats = pipeline.storage.get_unfinished_stats()
+    last_arrival = pipeline.storage.get_last_arrival_time()
+    chain_str = " -> ".join(f"{p.name}[{p.model}]" for p in pipeline.vision.active_providers)
+    retention_mode = (
+        f"archive -> {settings.viber_archive_dir}" if settings.viber_archive_dir else "delete"
+    )
+    retention_str = (
+        f"{settings.viber_retention_days} дн. ({retention_mode})"
+        if settings.viber_retention_days > 0
+        else "disabled"
+    )
+    tg_status = (
+        "configured"
+        if pipeline.notifier.is_configured
+        else "local-only (set TELEGRAM_BOT_TOKEN & TECH_ALERT_CHAT_ID in .env)"
+    )
+
+    print("Ramedas Reports Agent - статус:")
+    print(f"  viber_process    : {'running' if viber_alive else 'stopped'}")
+    print(f"  telegram_ingest  : {pipeline.telegram.status_label}")
+    print(f"  telegram_alerts  : {tg_status}")
+    print(
+        f"  work_hours       : {settings.work_hours_start}-{settings.work_hours_end} "
+        f"(тиша > {settings.silence_alert_minutes} хв, cooldown {settings.alert_cooldown_minutes} хв)"
+    )
+    print(
+        "  last_arrival     : "
+        f"{last_arrival.strftime('%Y-%m-%d %H:%M:%S') if last_arrival else 'none'}"
+    )
+    print(f"  llm_chain        : {chain_str or 'none'}")
+    print(f"  routing_config   : {pipeline.vision.routing_path}")
+    print(f"  review_threshold : {settings.confidence_review_threshold}")
+    print(
+        f"  catalog          : {len(pipeline.catalog.facilities)} закладів "
+        f"({len(pipeline.catalog._by_phone)} тел., {len(pipeline.catalog._by_surname)} прізвищ, "
+        f"автовивчено для {len(pipeline.catalog._learned_by_facility)} закладів)"
+    )
+    print(f"  viber_downloads  : {settings.viber_downloads_dir}")
+    print(f"  viber_retention  : {retention_str}")
+    print(f"  pending_queue    : {len(pending)} фото ({len(batches)} пакетів)")
+    print(f"  db_stats         : {stats}")
+    print(f"  storage_root     : {settings.storage_root}")
+    print(f"  reports_output   : {pipeline.storage.reports_dir}")
+    print(f"  log_file         : {LOG_FILE}")
+
+
+def _process_batches(
+    pipeline: ReportPipeline,
+    batches: list[list[IncomingMediaItem]],
+    *,
+    dry_run: bool,
+) -> None:
+    for idx, batch in enumerate(batches, 1):
+        log.info("Пакет %d/%d (%d фото)", idx, len(batches), len(batch))
+        pipeline.process_batch(batch, dry_run=dry_run)
+
+
+def _run_once(pipeline: ReportPipeline, args: argparse.Namespace) -> None:
+    pending, batches = pipeline.fetch_pending_batches(limit=args.limit)
+    log.info(
+        "Старт обробки черги: %d фото (%d пакетів), dry_run=%s",
+        len(pending),
+        len(batches),
+        args.dry_run,
+    )
+    _process_batches(pipeline, batches, dry_run=args.dry_run)
+    if args.limit == 0 or args.rotate_old:
+        pipeline.rotate_viber_downloads(
+            retention_days=args.retention_days,
+            dry_run=args.dry_run,
+        )
+    log.info("Обробку завершено.")
+
+
+def _run_watch(
+    pipeline: ReportPipeline,
+    settings: Settings,
+    args: argparse.Namespace,
+    *,
+    viber_alive: bool,
+) -> None:
+    log.info(
+        "Запущено моніторинг %s (telegram=%s, batch_window=%ds, retention=%dd)",
+        settings.viber_downloads_dir,
+        pipeline.telegram.status_label,
+        settings.batch_window_seconds,
+        settings.viber_retention_days,
+    )
+    last_watchdog_ts = time.time()
+    last_silence_ts = 0.0
+    last_rotate_ts = 0.0
+    last_tg_poll_ts = 0.0
+    try:
+        while True:
+            now_ts = time.time()
+            if now_ts - last_watchdog_ts >= 30.0:
+                viber_alive = pipeline.monitor.check_viber_health()
+                last_watchdog_ts = now_ts
+
+            if now_ts - last_silence_ts >= 60.0:
+                pipeline.monitor.check_silence(viber_running=viber_alive)
+                last_silence_ts = now_ts
+
+            if now_ts - last_rotate_ts >= 21600.0:
+                pipeline.rotate_viber_downloads(
+                    retention_days=args.retention_days,
+                    dry_run=args.dry_run,
+                )
+                last_rotate_ts = now_ts
+
+            poll_tg = (now_ts - last_tg_poll_ts) >= 30.0
+            if poll_tg:
+                last_tg_poll_ts = now_ts
+
+            pending, batches = pipeline.fetch_pending_batches(include_telegram=poll_tg)
+            if pending:
+                newest_age = now_ts - pending[-1].created_at.timestamp()
+                if newest_age >= settings.batch_window_seconds:
+                    log.info("У черзі %d фото (%d пакетів)", len(pending), len(batches))
+                    _process_batches(pipeline, batches, dry_run=args.dry_run)
+            time.sleep(5)
+    except KeyboardInterrupt:
+        log.info("Зупинено користувачем.")
+
+
+def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    args = _build_parser().parse_args()
     settings = Settings()
     pipeline = ReportPipeline(settings)
-    viber_alive = pipeline.watchdog.ensure_running()
 
-    if args.status or not (args.once or args.watch):
-        pending = pipeline.viber.fetch_pending_items()
-        batches = group_into_burst_batches(pending, max_gap_seconds=6)
-        stats = pipeline.storage.get_unfinished_stats()
-        chain_str = " -> ".join(
-            f"{p.name}[{p.model}]" for p in pipeline.vision.active_providers
-        )
-        print("Ramedas Reports Agent - статус:")
-        print(f"  viber_process    : {'running' if viber_alive else 'stopped'}")
-        print(f"  llm_chain        : {chain_str or 'none'}")
-        print(f"  routing_config   : {pipeline.vision.routing_path}")
-        print(f"  review_threshold : {settings.confidence_review_threshold}")
-        print(
-            f"  catalog          : {len(pipeline.catalog.facilities)} закладів "
-            f"({len(pipeline.catalog._by_phone)} тел., {len(pipeline.catalog._by_surname)} прізвищ, "
-            f"автовивчено для {len(pipeline.catalog._learned_by_facility)} закладів)"
-        )
-        print(f"  viber_downloads  : {settings.viber_downloads_dir}")
-        print(f"  pending_queue    : {len(pending)} фото ({len(batches)} пакетів)")
-        print(f"  db_stats         : {stats}")
-        print(f"  storage_root     : {settings.storage_root}")
-        print(f"  log_file         : {LOG_FILE}")
-        if not (args.once or args.watch):
-            return 0
-
-    if args.once:
-        pending = pipeline.viber.fetch_pending_items()
-        if args.limit > 0:
-            pending = pending[: args.limit]
-        batches = group_into_burst_batches(pending, max_gap_seconds=6)
-        log.info(
-            "Старт обробки черги: %d фото (%d пакетів), dry_run=%s",
-            len(pending),
-            len(batches),
-            args.dry_run,
-        )
-        for idx, batch in enumerate(batches, 1):
-            log.info("Пакет %d/%d (%d фото)", idx, len(batches), len(batch))
-            pipeline.process_batch(batch, dry_run=args.dry_run)
-        log.info("Обробку завершено.")
+    if args.telegram_login:
+        pipeline.telegram.interactive_login()
         return 0
 
-    if args.watch:
-        log.info(
-            "Запущено моніторинг %s (batch_window=%ds)",
-            settings.viber_downloads_dir,
-            settings.batch_window_seconds,
-        )
-        last_watchdog_ts = time.time()
-        try:
-            while True:
-                now_ts = time.time()
-                if now_ts - last_watchdog_ts >= 30.0:
-                    pipeline.watchdog.ensure_running()
-                    last_watchdog_ts = now_ts
+    if args.telegram_chats:
+        dialogs = pipeline.telegram.list_dialogs()
+        print(f"Доступні групові чати/канали Telegram ({len(dialogs)}):")
+        for dlg in dialogs:
+            mark = "active" if dlg["active"] else "filtered_out"
+            kind = "group" if dlg["is_group"] else "channel"
+            print(f"  {dlg['id']} | {kind:7s} | {mark:12s} | {dlg['title']}")
+        return 0
 
-                pending = pipeline.viber.fetch_pending_items()
-                if pending:
-                    newest_age = now_ts - pending[-1].created_at.timestamp()
-                    if newest_age >= settings.batch_window_seconds:
-                        batches = group_into_burst_batches(pending, max_gap_seconds=6)
-                        log.info("У черзі %d фото (%d пакетів)", len(pending), len(batches))
-                        for idx, batch in enumerate(batches, 1):
-                            log.info("Пакет %d/%d (%d фото)", idx, len(batches), len(batch))
-                            pipeline.process_batch(batch, dry_run=args.dry_run)
-                time.sleep(5)
-        except KeyboardInterrupt:
-            log.info("Зупинено користувачем.")
+    if args.activity_stats:
+        _print_activity_stats(pipeline, settings, args.days)
+        return 0
+
+    if args.test_alert:
+        tg_state = "підключений" if pipeline.notifier.is_configured else "ще не налаштований, запис локально"
+        pipeline.monitor.emit_alert(
+            "manual_test",
+            "info",
+            f"[Ramedas] Тестове технічне сповіщення (Telegram={tg_state}).",
+            force=True,
+        )
+        return 0
+
+    viber_alive = pipeline.watchdog.ensure_running()
+    has_action = args.once or args.watch or args.rotate_old
+
+    if args.status or not has_action:
+        _print_status(pipeline, settings, viber_alive=viber_alive)
+        if not has_action:
             return 0
+
+    if args.rotate_old and not (args.once or args.watch):
+        rot_stats = pipeline.rotate_viber_downloads(
+            retention_days=args.retention_days,
+            dry_run=args.dry_run,
+        )
+        if rot_stats.rotated == 0 and rot_stats.skipped_unprocessed == 0:
+            log.info("Старих оброблених файлів у ViberDownloads для ротації не знайдено.")
+        return 0
+
+    if args.once:
+        _run_once(pipeline, args)
+    elif args.watch:
+        _run_watch(pipeline, settings, args, viber_alive=viber_alive)
 
     return 0
 

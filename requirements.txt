@@ -4,3 +4,4 @@ python-dotenv>=1.0.1
 rapidfuzz>=3.9.0
 watchdog>=5.0.0
 pillow>=10.4.0
+telethon>=1.36.0

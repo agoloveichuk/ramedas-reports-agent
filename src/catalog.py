@@ -12,6 +12,7 @@ from src.models import FacilityMatch, VisionAnalysisResult
 STOP_WORDS: frozenset[str] = frozenset(
     {
         "ззсо",
+        "зош",
         "здо",
         "днз",
         "нвк",
@@ -211,6 +212,7 @@ class FacilityCatalog:
             target_distinct_str = " ".join(target_distinct)
 
             # А) Збіг за характерними словами назви закладу
+            name_added = False
             if fac_distinct and target_distinct:
                 fac_distinct_str = " ".join(fac_distinct)
                 sim = max(
@@ -230,6 +232,7 @@ class FacilityCatalog:
                 if sim >= 0.72:
                     weight = 0.50 if vision.matched_facility_id else 0.75
                     score += sim * weight
+                    name_added = True
                     reasons.append(f"name:{sim:.2f}")
 
             # Б) Збіг населеного пункту / громади / адреси
@@ -252,7 +255,13 @@ class FacilityCatalog:
                         matched_specific.append(st)
 
                 if matched_specific:
-                    score += 0.65 if not fac_distinct else 0.30
+                    only_settle_tokens = not fac_distinct or set(fac_distinct) <= set(matched_specific)
+                    is_clear_waybill = (
+                        vision.document_type in ("waybill_external", "waybill_internal")
+                        and vision.legibility == "clear"
+                    )
+                    base_settle_score = 0.85 if is_clear_waybill else 0.65
+                    score += base_settle_score if (not name_added and only_settle_tokens) else 0.30
                     reasons.append(f"settlement:{','.join(matched_specific[:2])}")
                     if vision.document_type in ("waybill_external", "waybill_internal"):
                         independent_confirm = True
@@ -266,14 +275,18 @@ class FacilityCatalog:
                     _normalize_text(c.get("name", "")) for c in fac.get("contacts", [])
                 )
                 learned_contacts = " ".join(self._learned_by_facility.get(fac["id"], []))
-                fac_contacts = f"{static_contacts} {learned_contacts}".strip()
+                static_tokens = set(static_contacts.split())
+                learned_tokens = set(learned_contacts.split())
                 for surname in person_surnames:
-                    if surname and surname in fac_contacts:
+                    norm_surname = surname.replace("’", "'").replace("`", "'").strip(".,;:\"'")
+                    in_static = bool(norm_surname and norm_surname in static_tokens)
+                    in_learned = bool(norm_surname and norm_surname in learned_tokens)
+                    if in_static or in_learned:
                         is_unique_surname = len(self._by_surname.get(surname, [])) == 1
                         if score > 0 or (not query_distinct and is_unique_surname):
                             bonus = 0.65 if (not query_distinct and is_unique_surname) else 0.25
                             score += bonus
-                            source_tag = "contact" if surname in static_contacts else "learned_contact"
+                            source_tag = "contact" if in_static else "learned_contact"
                             reasons.append(f"{source_tag}:{surname}")
                             independent_confirm = True
                         break

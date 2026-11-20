@@ -50,8 +50,16 @@ class ViberProcessWatchdog:
         Якщо Viber.exe запущений — повертає True.
         Якщо процес відсутній — запускає Viber.exe у фоні й логує подію.
         """
+        running, _ = self.check_and_recover()
+        return running
+
+    def check_and_recover(self) -> tuple[bool, bool]:
+        """
+        Перевіряє, чи запущений Viber.exe, і при падінні намагається його перезапустити.
+        Повертає кортеж (is_running, was_restarted).
+        """
         if self.is_viber_running():
-            return True
+            return True, False
 
         logger.warning("Процес Viber.exe НЕ знайдено! Ініціюємо автоматичний запуск...")
         if not self.viber_exe_path.exists():
@@ -59,20 +67,20 @@ class ViberProcessWatchdog:
                 "Не вдалося запустити Viber: виконуваний файл не знайдено за шляхом %s",
                 self.viber_exe_path,
             )
-            return False
+            return False, False
 
         # Захист від занадто частих перезапусків (не частіше 1 разу на 60 секунд)
         now = time.time()
         if now - self.last_restart_ts < 60.0:
             logger.warning("Пропуск перезапуску Viber.exe: минуло менше 60с після попередньої спроби.")
-            return False
+            return False, False
 
         try:
             subprocess.Popen(
                 [str(self.viber_exe_path)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                creationflags= getattr(subprocess, "DETACHED_PROCESS", 0x00000008),
+                creationflags=getattr(subprocess, "DETACHED_PROCESS", 0x00000008),
             )
             self.restart_count += 1
             self.last_restart_ts = now
@@ -85,7 +93,7 @@ class ViberProcessWatchdog:
                 )
             else:
                 logger.error("Команду запуску Viber.exe виконано, але процес не з'явився.")
-            return running
+            return running, running
         except Exception as exc:
             logger.error("Критична помилка при спробі запустити Viber.exe: %s", exc)
-            return False
+            return False, False

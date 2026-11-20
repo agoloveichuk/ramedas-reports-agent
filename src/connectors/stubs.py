@@ -1,16 +1,10 @@
 from __future__ import annotations
 
 from src.connectors.base import BaseConnector
+from src.connectors.telegram_user import TelegramUserConnector
 from src.models import IncomingMediaItem
 
-
-class TelegramConnectorStub(BaseConnector):
-    """Заготовка для майбутнього підключення груп Telegram (aiogram / Telethon)."""
-
-    channel_name = "telegram"
-
-    def fetch_pending_items(self) -> list[IncomingMediaItem]:
-        return []
+TelegramConnectorStub = TelegramUserConnector
 
 
 class WahaConnectorStub(BaseConnector):

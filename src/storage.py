@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta
 import json
 from pathlib import Path
 import re
-import shutil
 import sqlite3
-from typing import Optional
+from typing import Iterator, Optional
 
 from src.connectors.viber_local import compute_file_sha256
+from src.date_utils import (
+    DOCUMENT_TYPE_LABELS,
+    format_month_folder,
+    shorten_facility_dirname,
+    validate_document_date,
+)
+from src.image_utils import save_oriented_image
 from src.logger import get_logger
 from src.models import FacilityMatch, IncomingMediaItem, VisionAnalysisResult
 
@@ -101,6 +108,32 @@ IGNORED_SURNAMES = frozenset(
 )
 
 
+IGNORED_STAMP_NUMBERS = frozenset({"201"})
+STAMP_ELIGIBLE_DOC_TYPES = frozenset(
+    {
+        "act",
+        "menu",
+        "application",
+        "daily_report",
+        "waybill_internal",
+        "waybill_external",
+    }
+)
+
+
+def _normalize_stamp_number(stamp_number: Optional[str]) -> Optional[str]:
+    digits = re.sub(r"\D+", "", stamp_number or "")
+    if not digits or len(digits) > 3:
+        return None
+    val = int(digits)
+    if val <= 0:
+        return None
+    norm = str(val)
+    if norm in IGNORED_STAMP_NUMBERS:
+        return None
+    return norm
+
+
 def _extract_clean_surname(person_hint: str) -> str:
     cleaned = re.sub(r"\(.*?\)", "", person_hint or "").strip().lower()
     cleaned = cleaned.replace("’", "'").replace("`", "'")
@@ -124,26 +157,45 @@ def _safe_dirname(name: str) -> str:
 
 
 class ReportStorage:
-    def __init__(self, storage_root: Path) -> None:
+    def __init__(
+        self,
+        storage_root: Path,
+        *,
+        reports_output_dir: Optional[Path] = None,
+        document_date_max_age_days: int = 14,
+    ) -> None:
         self.storage_root = storage_root
-        self.reports_dir = storage_root / "reports"
+        self.reports_output_dir = reports_output_dir
+        self.document_date_max_age_days = max(1, document_date_max_age_days)
+        self.reports_root = reports_output_dir or (storage_root / "reports")
+        self.reports_dir = self.reports_root / "Щоденні документи"
         self.needs_review_dir = storage_root / "needs_review"
         self.unmatched_dir = storage_root / "unmatched"
         self.ignored_dir = storage_root / "ignored_non_reports"
         self.db_path = storage_root / "state.db"
 
-        for directory in (
-            self.storage_root,
-            self.reports_dir,
-            self.needs_review_dir,
-            self.unmatched_dir,
-        ):
+        local_dirs = [self.storage_root, self.needs_review_dir, self.unmatched_dir]
+        if reports_output_dir is None:
+            local_dirs.append(self.reports_dir)
+        for directory in local_dirs:
             directory.mkdir(parents=True, exist_ok=True)
 
         self._init_db()
 
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS processed_media (
@@ -165,11 +217,25 @@ class ReportStorage:
                     ai_confidence REAL,
                     legibility TEXT DEFAULT 'clear',
                     needs_review INTEGER DEFAULT 0,
+                    rotation_degrees INTEGER DEFAULT 0,
                     used_model TEXT,
                     latency_ms INTEGER,
                     match_reason TEXT,
                     vision_json TEXT,
+                    received_at TEXT,
                     processed_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alert_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_key TEXT NOT NULL,
+                    severity TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    delivered_telegram INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
                 )
                 """
             )
@@ -180,6 +246,8 @@ class ReportStorage:
                     facility_id TEXT NOT NULL,
                     canonical_name TEXT NOT NULL,
                     region TEXT NOT NULL,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    is_ambiguous INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 )
                 """
@@ -206,6 +274,12 @@ class ReportStorage:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_processed_status ON processed_media(status)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_processed_received_at ON processed_media(received_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_alert_events_key_time ON alert_events(alert_key, created_at)"
+            )
 
     def _migrate_columns(self, conn: sqlite3.Connection) -> None:
         existing_cols = {
@@ -219,8 +293,10 @@ class ReportStorage:
             ("ai_confidence", "REAL"),
             ("legibility", "TEXT DEFAULT 'clear'"),
             ("needs_review", "INTEGER DEFAULT 0"),
+            ("rotation_degrees", "INTEGER DEFAULT 0"),
             ("used_model", "TEXT"),
             ("latency_ms", "INTEGER"),
+            ("received_at", "TEXT"),
         ]
         for col_name, col_type in migrations:
             if col_name not in existing_cols:
@@ -244,11 +320,81 @@ class ReportStorage:
         ).fetchall()
         for media_id, src_path in rows_missing_hash:
             path = Path(src_path)
-            if path.exists():
-                sha = compute_file_sha256(path)
+            try:
+                if path.exists():
+                    sha = compute_file_sha256(path)
+                    conn.execute(
+                        "UPDATE processed_media SET file_sha256 = ? WHERE media_id = ?",
+                        (sha, media_id),
+                    )
+            except OSError:
+                pass
+
+        rows_missing_received = conn.execute(
+            "SELECT media_id, saved_path, processed_at FROM processed_media WHERE received_at IS NULL"
+        ).fetchall()
+        for media_id, saved_path, processed_at in rows_missing_received:
+            received_iso = processed_at
+            if saved_path:
+                try:
+                    sp = Path(saved_path)
+                    if sp.exists():
+                        received_iso = datetime.fromtimestamp(sp.stat().st_mtime).isoformat(
+                            timespec="seconds"
+                        )
+                except OSError:
+                    pass
+            conn.execute(
+                "UPDATE processed_media SET received_at = ? WHERE media_id = ?",
+                (received_iso, media_id),
+            )
+
+        stamp_cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(stamp_registry)").fetchall()
+        }
+        if "occurrences" not in stamp_cols:
+            conn.execute(
+                "ALTER TABLE stamp_registry ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1"
+            )
+        newly_added_ambiguity = "is_ambiguous" not in stamp_cols
+        if newly_added_ambiguity:
+            conn.execute(
+                "ALTER TABLE stamp_registry ADD COLUMN is_ambiguous INTEGER NOT NULL DEFAULT 0"
+            )
+            self._reconcile_legacy_stamp_conflicts(conn)
+
+        if IGNORED_STAMP_NUMBERS:
+            placeholders = ",".join("?" for _ in IGNORED_STAMP_NUMBERS)
+            conn.execute(
+                f"DELETE FROM stamp_registry WHERE stamp_number IN ({placeholders})",
+                tuple(IGNORED_STAMP_NUMBERS),
+            )
+
+    @staticmethod
+    def _reconcile_legacy_stamp_conflicts(conn: sqlite3.Connection) -> None:
+        """Позначає неоднозначними старі штампи, які в історії траплялися на різних закладах."""
+        facilities_by_stamp: dict[str, set[str]] = {}
+        rows = conn.execute(
+            """
+            SELECT facility_id, vision_json
+            FROM processed_media
+            WHERE facility_id IS NOT NULL AND vision_json IS NOT NULL
+            """
+        ).fetchall()
+        for facility_id, raw_json in rows:
+            try:
+                stamp_raw = json.loads(raw_json).get("stamp_number")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            norm = _normalize_stamp_number(stamp_raw)
+            if norm:
+                facilities_by_stamp.setdefault(norm, set()).add(facility_id)
+
+        for norm_stamp, fids in facilities_by_stamp.items():
+            if len(fids) > 1:
                 conn.execute(
-                    "UPDATE processed_media SET file_sha256 = ? WHERE media_id = ?",
-                    (sha, media_id),
+                    "UPDATE stamp_registry SET is_ambiguous = 1 WHERE stamp_number = ?",
+                    (norm_stamp,),
                 )
 
     def is_completed(self, media_id: str) -> bool:
@@ -257,8 +403,7 @@ class ReportStorage:
         Файли зі статусом 'processing' (перервані збоєм) або 'failed' (retry_count < 5)
         повертають False і автоматично підхоплюються повторно.
         """
-        placeholders = ",".join("?" for _ in COMPLETED_STATUSES)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 f"""
                 SELECT status, COALESCE(retry_count, 0)
@@ -277,14 +422,16 @@ class ReportStorage:
             return False
 
     def mark_processing(self, item: IncomingMediaItem) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        received_iso = item.created_at.isoformat(timespec="seconds")
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO processed_media (
-                    media_id, file_sha256, status, channel, source_path, is_report, processed_at
-                ) VALUES (?, ?, 'processing', ?, ?, 1, ?)
+                    media_id, file_sha256, status, channel, source_path, is_report, received_at, processed_at
+                ) VALUES (?, ?, 'processing', ?, ?, 1, ?, ?)
                 ON CONFLICT(media_id) DO UPDATE SET
                     status = 'processing',
+                    received_at = COALESCE(processed_media.received_at, excluded.received_at),
                     processed_at = excluded.processed_at
                 """,
                 (
@@ -292,12 +439,14 @@ class ReportStorage:
                     item.file_sha256,
                     item.channel,
                     str(item.file_path),
+                    received_iso,
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
 
     def mark_failed(self, item: IncomingMediaItem, error_msg: str) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        received_iso = item.created_at.isoformat(timespec="seconds")
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT COALESCE(retry_count, 0) FROM processed_media WHERE media_id = ?",
                 (item.media_id,),
@@ -307,12 +456,13 @@ class ReportStorage:
                 """
                 INSERT INTO processed_media (
                     media_id, file_sha256, status, retry_count, last_error,
-                    channel, source_path, is_report, processed_at
-                ) VALUES (?, ?, 'failed', ?, ?, ?, ?, 1, ?)
+                    channel, source_path, is_report, received_at, processed_at
+                ) VALUES (?, ?, 'failed', ?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT(media_id) DO UPDATE SET
                     status = 'failed',
                     retry_count = ?,
                     last_error = excluded.last_error,
+                    received_at = COALESCE(processed_media.received_at, excluded.received_at),
                     processed_at = excluded.processed_at
                 """,
                 (
@@ -322,6 +472,7 @@ class ReportStorage:
                     error_msg[:500],
                     item.channel,
                     str(item.file_path),
+                    received_iso,
                     datetime.now().isoformat(timespec="seconds"),
                     retries,
                 ),
@@ -329,11 +480,21 @@ class ReportStorage:
             return retries
 
     def get_unfinished_stats(self) -> dict[str, int]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) FROM processed_media GROUP BY status"
             ).fetchall()
             return {status: count for status, count in rows}
+
+    def get_final_status_media_ids(self) -> set[str]:
+        """Повертає множину media_id, які вже мають фінальний статус обробки у state.db."""
+        placeholders = ",".join("?" for _ in COMPLETED_STATUSES)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT media_id FROM processed_media WHERE status IN ({placeholders})",
+                COMPLETED_STATUSES,
+            ).fetchall()
+            return {row[0] for row in rows}
 
     def find_duplicate_by_sha256(
         self, file_sha256: Optional[str], current_media_id: str
@@ -342,7 +503,7 @@ class ReportStorage:
             return None
         placeholders = ",".join("?" for _ in COMPLETED_STATUSES if _ != "duplicate")
         valid_statuses = [s for s in COMPLETED_STATUSES if s != "duplicate"]
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 f"""
                 SELECT media_id, COALESCE(saved_path, source_path)
@@ -357,13 +518,13 @@ class ReportStorage:
             return (row[0], row[1]) if row else None
 
     def record_duplicate(self, item: IncomingMediaItem, original_media_id: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO processed_media (
                     media_id, file_sha256, status, retry_count, last_error,
-                    channel, source_path, saved_path, is_report, match_reason, processed_at
-                ) VALUES (?, ?, 'duplicate', 0, NULL, ?, ?, NULL, 0, ?, ?)
+                    channel, source_path, saved_path, is_report, match_reason, received_at, processed_at
+                ) VALUES (?, ?, 'duplicate', 0, NULL, ?, ?, NULL, 0, ?, ?, ?)
                 """,
                 (
                     item.media_id,
@@ -371,19 +532,175 @@ class ReportStorage:
                     item.channel,
                     str(item.file_path),
                     f"duplicate_of:{original_media_id}",
+                    item.created_at.isoformat(timespec="seconds"),
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
 
-    def lookup_stamp(self, stamp_number: Optional[str]) -> Optional[FacilityMatch]:
-        if not stamp_number:
-            return None
-        num = re.sub(r"\D+", "", stamp_number)
-        if not num or len(num) > 3:
-            return None
-        with sqlite3.connect(self.db_path) as conn:
+    def record_alert(
+        self,
+        alert_key: str,
+        severity: str,
+        message: str,
+        *,
+        delivered_telegram: bool,
+        created_at: Optional[datetime] = None,
+    ) -> None:
+        ts = (created_at or datetime.now()).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO alert_events (alert_key, severity, message, delivered_telegram, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (alert_key, severity, message[:1000], 1 if delivered_telegram else 0, ts),
+            )
+
+    def get_last_alert_time(self, alert_key: str) -> Optional[datetime]:
+        with self._connect() as conn:
             row = conn.execute(
-                "SELECT facility_id, canonical_name, region FROM stamp_registry WHERE stamp_number = ?",
+                "SELECT MAX(created_at) FROM alert_events WHERE alert_key = ?",
+                (alert_key,),
+            ).fetchone()
+        if row and row[0]:
+            try:
+                return datetime.fromisoformat(row[0])
+            except ValueError:
+                return None
+        return None
+
+    def get_recent_alerts(self, limit: int = 20) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT alert_key, severity, message, delivered_telegram, created_at
+                FROM alert_events
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [
+            {
+                "alert_key": r[0],
+                "severity": r[1],
+                "message": r[2],
+                "delivered_telegram": bool(r[3]),
+                "created_at": r[4],
+            }
+            for r in rows
+        ]
+
+    def get_last_arrival_time(self) -> Optional[datetime]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(COALESCE(received_at, processed_at)) FROM processed_media"
+            ).fetchone()
+        if row and row[0]:
+            try:
+                return datetime.fromisoformat(row[0][:19])
+            except ValueError:
+                return None
+        return None
+
+    def get_activity_stats(
+        self,
+        *,
+        days: int = 14,
+        work_start_hour: int = 9,
+        work_end_hour: int = 18,
+        now: Optional[datetime] = None,
+    ) -> dict:
+        """
+        Повертає статистику надходження файлів за останні N днів:
+        - розподіл по годинах доби (00..23) та частка у робочий час;
+        - статистика по громадах/регіонах (кількість, останній прихід, пікова година);
+        - кількість надходжень за сьогодні.
+        """
+        ref_now = now or datetime.now()
+        since_iso = (ref_now - timedelta(days=days)).isoformat(timespec="seconds")
+        today_prefix = ref_now.strftime("%Y-%m-%d")
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT COALESCE(received_at, processed_at) AS ts, region, status
+                FROM processed_media
+                WHERE COALESCE(received_at, processed_at) >= ?
+                """,
+                (since_iso,),
+            ).fetchall()
+
+        hourly_counts: dict[int, int] = {h: 0 for h in range(24)}
+        today_count = 0
+        work_hours_count = 0
+        total_count = 0
+        last_arrival: Optional[str] = None
+        by_region: dict[str, dict] = {}
+
+        for ts_str, region, _status in rows:
+            if not ts_str:
+                continue
+            ts_clean = ts_str[:19]
+            try:
+                dt = datetime.fromisoformat(ts_clean)
+            except ValueError:
+                continue
+
+            total_count += 1
+            hourly_counts[dt.hour] += 1
+            if work_start_hour <= dt.hour < work_end_hour:
+                work_hours_count += 1
+            if ts_clean.startswith(today_prefix):
+                today_count += 1
+            if last_arrival is None or ts_clean > last_arrival:
+                last_arrival = ts_clean
+
+            reg_key = region or "Невизначено / Інше"
+            reg_info = by_region.setdefault(
+                reg_key,
+                {"count": 0, "last_arrival": ts_clean, "hours": {}},
+            )
+            reg_info["count"] += 1
+            if ts_clean > reg_info["last_arrival"]:
+                reg_info["last_arrival"] = ts_clean
+            reg_info["hours"][dt.hour] = reg_info["hours"].get(dt.hour, 0) + 1
+
+        region_summary = []
+        for reg_name, info in sorted(
+            by_region.items(), key=lambda kv: kv[1]["count"], reverse=True
+        ):
+            peak_hour = max(info["hours"], key=info["hours"].get)
+            region_summary.append(
+                {
+                    "region": reg_name,
+                    "count": info["count"],
+                    "last_arrival": info["last_arrival"],
+                    "peak_hour": peak_hour,
+                }
+            )
+
+        return {
+            "days": days,
+            "total_count": total_count,
+            "today_count": today_count,
+            "work_hours_count": work_hours_count,
+            "last_arrival": last_arrival,
+            "hourly_counts": hourly_counts,
+            "by_region": region_summary,
+        }
+
+    def lookup_stamp(self, stamp_number: Optional[str]) -> Optional[FacilityMatch]:
+        num = _normalize_stamp_number(stamp_number)
+        if not num:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT facility_id, canonical_name, region
+                FROM stamp_registry
+                WHERE stamp_number = ? AND COALESCE(is_ambiguous, 0) = 0
+                """,
                 (num,),
             ).fetchone()
         if row:
@@ -398,31 +715,69 @@ class ReportStorage:
             )
         return None
 
-    def register_stamp(self, stamp_number: Optional[str], match: FacilityMatch) -> None:
-        if not stamp_number or match.score < 0.80 or match.needs_review:
+    def register_stamp(
+        self,
+        stamp_number: Optional[str],
+        match: FacilityMatch,
+        *,
+        document_type: Optional[str] = None,
+    ) -> None:
+        if match.score < 0.80 or match.needs_review:
             return
-        num = re.sub(r"\D+", "", stamp_number)
-        if not num or len(num) > 3:
+        if match.match_reason.startswith("stamp_registry:"):
             return
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                """
-                INSERT INTO stamp_registry (stamp_number, facility_id, canonical_name, region, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(stamp_number) DO UPDATE SET
-                    facility_id = excluded.facility_id,
-                    canonical_name = excluded.canonical_name,
-                    region = excluded.region,
-                    updated_at = excluded.updated_at
-                """,
-                (
+        if document_type and document_type not in STAMP_ELIGIBLE_DOC_TYPES:
+            return
+        num = _normalize_stamp_number(stamp_number)
+        if not num:
+            return
+
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT facility_id FROM stamp_registry WHERE stamp_number = ?",
+                (num,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO stamp_registry (
+                        stamp_number, facility_id, canonical_name, region, occurrences, is_ambiguous, updated_at
+                    ) VALUES (?, ?, ?, ?, 1, 0, ?)
+                    """,
+                    (num, match.facility_id, match.canonical_name, match.region, now_iso),
+                )
+                return
+
+            if row[0] == match.facility_id:
+                conn.execute(
+                    """
+                    UPDATE stamp_registry
+                    SET canonical_name = ?,
+                        region = ?,
+                        occurrences = COALESCE(occurrences, 1) + 1,
+                        updated_at = ?
+                    WHERE stamp_number = ?
+                    """,
+                    (match.canonical_name, match.region, now_iso, num),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE stamp_registry
+                    SET is_ambiguous = 1,
+                        occurrences = COALESCE(occurrences, 1) + 1,
+                        updated_at = ?
+                    WHERE stamp_number = ?
+                    """,
+                    (now_iso, num),
+                )
+                log.warning(
+                    "Конфлікт штампа №%s (%s vs %s) — позначено як неоднозначний",
                     num,
+                    row[0],
                     match.facility_id,
-                    match.canonical_name,
-                    match.region,
-                    datetime.now().isoformat(timespec="seconds"),
-                ),
-            )
+                )
 
     def learn_contacts(self, vision: VisionAnalysisResult, match: FacilityMatch) -> list[str]:
         """
@@ -441,7 +796,7 @@ class ReportStorage:
 
         learned_now: list[str] = []
         now_iso = datetime.now().isoformat(timespec="seconds")
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             for raw_person in vision.person_hints:
                 surname = _extract_clean_surname(raw_person)
                 if not surname:
@@ -472,7 +827,7 @@ class ReportStorage:
 
     def get_learned_contacts_map(self) -> dict[str, list[str]]:
         """Повертає словник {facility_id: [surname, ...]} для прізвищ, які не є наскрізними між >2 школами."""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             # Відсікаємо прізвища, які зустрічаються більш ніж у 2 закладах (водії/експедитори/поширені однофамільці)
             rows = conn.execute(
                 """
@@ -491,10 +846,13 @@ class ReportStorage:
             result.setdefault(fac_id, []).append(surname)
         return result
 
-    def backfill_learned_contacts_from_history(self) -> int:
+    def backfill_learned_contacts_from_history(self, *, force: bool = False) -> int:
         """Заповнює таблицю learned_contacts з уже оброблених чітких актів/меню/заявок у state.db."""
-        count = 0
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
+            if not force:
+                has_any = conn.execute("SELECT 1 FROM learned_contacts LIMIT 1").fetchone()
+                if has_any:
+                    return 0
             rows = conn.execute(
                 """
                 SELECT facility_id, canonical_name, region, match_score, legibility, document_type, vision_json
@@ -507,6 +865,7 @@ class ReportStorage:
                 """
             ).fetchall()
 
+        count = 0
         for fac_id, canon_name, region, score, leg, doc_type, vjson in rows:
             vis = VisionAnalysisResult.model_validate(json.loads(vjson))
             match = FacilityMatch(
@@ -532,7 +891,15 @@ class ReportStorage:
         latency_ms: int = 0,
         copy_files: bool = True,
     ) -> Optional[Path]:
-        date_folder = item.created_at.strftime("%Y-%m-%d")
+        received_date = item.created_at.strftime("%Y-%m-%d")
+        doc_date_str, _ = validate_document_date(
+            vision.document_date,
+            item.created_at,
+            max_past_days=self.document_date_max_age_days,
+        )
+        doc_date_obj = date.fromisoformat(doc_date_str)
+        month_folder = format_month_folder(doc_date_obj)
+        doc_label = DOCUMENT_TYPE_LABELS.get(vision.document_type, vision.document_type)
         ext = item.file_path.suffix or ".jpg"
         short_id = item.media_id[-12:] if len(item.media_id) > 12 else item.media_id
 
@@ -540,27 +907,35 @@ class ReportStorage:
 
         if not vision.is_report:
             status = "ignored_non_report"
-            filename = f"{date_folder}_{vision.document_type}_{short_id}{ext}"
-            target_dir = self.ignored_dir / date_folder
+            filename = f"{received_date}_{doc_label}_{short_id}{ext}"
+            target_dir = self.ignored_dir / received_date
         elif match and not match.needs_review:
             status = "matched"
-            filename = f"{date_folder}_{vision.document_type}_{short_id}{ext}"
+            filename = f"{doc_date_str}_{doc_label}_{short_id}{ext}"
             region_dir = _safe_dirname(match.region)
-            fac_dir = _safe_dirname(f"{match.facility_id}_{match.canonical_name}")
-            target_dir = self.reports_dir / region_dir / fac_dir / date_folder
+            fac_dir = _safe_dirname(shorten_facility_dirname(match.canonical_name))
+            target_dir = (
+                self.reports_dir / region_dir / fac_dir / month_folder / doc_date_str
+            )
+            if vision.document_type == "food_photo":
+                target_dir = target_dir / "Контрольна порція"
         elif match and match.needs_review:
             status = "needs_review"
-            cand_prefix = _safe_dirname(f"{match.facility_id}_{match.canonical_name[:30]}")
-            filename = f"REVIEW_{cand_prefix}_{vision.document_type}_{short_id}{ext}"
-            target_dir = self.needs_review_dir / date_folder
+            cand_prefix = _safe_dirname(
+                f"{match.facility_id}_{shorten_facility_dirname(match.canonical_name, max_len=35)}"
+            )
+            filename = f"REVIEW_{cand_prefix}_{doc_label}_{short_id}{ext}"
+            target_dir = self.needs_review_dir / doc_date_str
         else:
             status = "unmatched"
-            filename = f"{date_folder}_{vision.document_type}_{short_id}{ext}"
-            target_dir = self.unmatched_dir / date_folder
+            filename = f"{doc_date_str}_{doc_label}_{short_id}{ext}"
+            target_dir = self.unmatched_dir / doc_date_str
+            if vision.document_type == "food_photo":
+                target_dir = target_dir / "Контрольна порція"
 
         if copy_files:
             # Якщо файл уже був збережений раніше в іншу папку (наприклад, до консенсусу пакета), прибираємо стару копію
-            with sqlite3.connect(self.db_path) as conn:
+            with self._connect() as conn:
                 prev = conn.execute(
                     "SELECT saved_path FROM processed_media WHERE media_id = ?",
                     (item.media_id,),
@@ -572,9 +947,13 @@ class ReportStorage:
 
             target_dir.mkdir(parents=True, exist_ok=True)
             saved_path = target_dir / filename
-            shutil.copy2(item.file_path, saved_path)
+            save_oriented_image(
+                item.file_path,
+                saved_path,
+                rotation_degrees=vision.rotation_degrees,
+            )
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO processed_media (
@@ -583,8 +962,8 @@ class ReportStorage:
                     is_report, document_type, document_date,
                     facility_id, canonical_name, region,
                     match_score, ai_confidence, legibility, needs_review,
-                    used_model, latency_ms, match_reason, vision_json, processed_at
-                ) VALUES (?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    rotation_degrees, used_model, latency_ms, match_reason, vision_json, received_at, processed_at
+                ) VALUES (?, ?, ?, 0, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item.media_id,
@@ -603,10 +982,12 @@ class ReportStorage:
                     vision.confidence,
                     vision.legibility,
                     1 if (match and match.needs_review) else 0,
+                    vision.rotation_degrees,
                     used_model,
                     latency_ms,
                     match.match_reason if match else None,
                     json.dumps(vision.model_dump(), ensure_ascii=False),
+                    item.created_at.isoformat(timespec="seconds"),
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )

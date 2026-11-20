@@ -3,7 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from src.image_utils import RotationDegrees, normalize_rotation_degrees
 
 ChannelType = Literal["viber", "telegram", "waha"]
 LegibilityType = Literal["clear", "medium", "poor"]
@@ -15,6 +17,7 @@ DocumentType = Literal[
     "application",
     "waybill_internal",
     "waybill_external",
+    "receipt",
     "food_photo",
     "other",
 ]
@@ -43,6 +46,10 @@ class VisionAnalysisResult(BaseModel):
     document_type: DocumentType = "other"
     document_date: Optional[str] = Field(
         default=None, description="Дата документа у форматі YYYY-MM-DD, якщо видно"
+    )
+    raw_document_date: Optional[str] = Field(
+        default=None,
+        description="Початкова розпізнана дата до валідації (заповнюється пайплайном при корекції)",
     )
     matched_facility_id: Optional[str] = Field(
         default=None,
@@ -74,7 +81,19 @@ class VisionAnalysisResult(BaseModel):
         le=1.0,
         description="Рівень впевненості у визначенні закладу від 0.0 до 1.0 (став < 0.75, якщо почерк важкий і є сумнів між схожими назвами)",
     )
+    rotation_degrees: RotationDegrees = Field(
+        default=0,
+        description=(
+            "Кут повороту фото ЗА ГОДИННИКОВОЮ СТРІЛКОЮ (0, 90, 180 або 270), щоб поставити документ рівно шапкою догори: "
+            "0 — шапка ЗВЕРХУ; 90 — шапка ЗЛІВА; 180 — шапка ЗНИЗУ; 270 — шапка СПРАВА"
+        ),
+    )
     summary: str = Field(default="", description="Короткий опис розпізнаного документа")
+
+    @field_validator("rotation_degrees", mode="before")
+    @classmethod
+    def _validate_rotation(cls, value: object) -> RotationDegrees:
+        return normalize_rotation_degrees(value)
 
 
 class FacilityMatch(BaseModel):
