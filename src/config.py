@@ -12,8 +12,11 @@ load_dotenv(PROJECT_ROOT / ".env")
 # Юридичні особи групи компаній, які НЕ є навчальними закладами і мають ігноруватися як facility_hint
 IGNORED_LEGAL_ENTITIES: tuple[str, ...] = (
     "рамедас",
+    "рамадас",
     "рамедас україна",
     "тов рамедас",
+    "дженерал девелопмент",
+    "дженерал девелопмент україна",
     "фондако",
     "мистецтво смаку",
     "школярик",
@@ -133,5 +136,8 @@ class Settings:
     )
     alert_cooldown_minutes: int = field(
         default_factory=lambda: _env_int("ALERT_COOLDOWN_MINUTES", 60)
+    )
+    daily_summary_time: str = field(
+        default_factory=lambda: _env_str("DAILY_SUMMARY_TIME", "18:30")
     )
     ignored_entities: tuple[str, ...] = IGNORED_LEGAL_ENTITIES

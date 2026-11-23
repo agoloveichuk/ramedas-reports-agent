@@ -149,8 +149,24 @@ class ReportPipeline:
             chat_title=item.chat_title,
             caption=item.caption,
         )
-        if not match and vis.stamp_number:
-            match = self.storage.lookup_stamp(vis.stamp_number)
+        if not vis.stamp_number:
+            return match
+
+        stamp_hit = self.storage.lookup_stamp(vis.stamp_number)
+        if not stamp_hit:
+            return match
+        if match is None:
+            return stamp_hit
+        if match.needs_review and stamp_hit.facility_id == match.facility_id:
+            return FacilityMatch(
+                facility_id=match.facility_id,
+                canonical_name=match.canonical_name,
+                region=match.region,
+                score=max(match.score, stamp_hit.score),
+                legibility=match.legibility,
+                needs_review=False,
+                match_reason=f"{match.match_reason}+{stamp_hit.match_reason}",
+            )
         return match
 
     def _is_duplicate(
@@ -190,8 +206,22 @@ class ReportPipeline:
         seen_hashes_in_batch[item.file_sha256] = item.media_id
         return False
 
-    @staticmethod
-    def _normalize_report_flags(vis: VisionAnalysisResult) -> None:
+    _CONSOLIDATED_MULTI_FACILITY_MARKERS = (
+        "зведена таблиця",
+        "розподілу продуктів по закладах",
+        "маршрутний лист",
+        "графік розвозки",
+        "графік водіїв",
+    )
+
+    @classmethod
+    def _normalize_report_flags(cls, vis: VisionAnalysisResult) -> None:
+        if not vis.matched_facility_id:
+            combined_text = f"{vis.facility_hint or ''} {vis.summary or ''}".lower()
+            if any(marker in combined_text for marker in cls._CONSOLIDATED_MULTI_FACILITY_MARKERS):
+                vis.is_report = False
+                return
+
         if vis.is_report:
             return
         always_report_types = (
@@ -208,6 +238,25 @@ class ReportPipeline:
             and bool(vis.matched_facility_id or vis.facility_hint)
         ):
             vis.is_report = True
+
+    @staticmethod
+    def _is_better_match(
+        current: Optional[FacilityMatch],
+        candidate: Optional[FacilityMatch],
+    ) -> bool:
+        if candidate is None:
+            return False
+        if current is None:
+            return True
+        if current.needs_review and not candidate.needs_review:
+            return True
+        if not current.needs_review and candidate.needs_review:
+            return False
+        if candidate.score > current.score:
+            return True
+        if candidate.score == current.score:
+            return candidate.legibility != "poor" or current.legibility == "poor"
+        return False
 
     def _analyze_with_upright_retry(
         self, item: IncomingMediaItem
@@ -233,44 +282,88 @@ class ReportPipeline:
                 or vis.confidence < 0.90
             )
         )
-        if not needs_upright_retry:
-            return vis, match
-
-        try:
-            vis_upright = self.vision.analyze_image(
-                item.file_path,
-                caption=item.caption,
-                rotation_degrees=detected_rotation,
-                reference_date=item.created_at,
-            )
-            self._normalize_report_flags(vis_upright)
-            # Додаємо залишковий кут після перевороту (наприклад, 270° + 180° -> 90° для горизонтальних ТТН)
-            combined_rotation = normalize_rotation_degrees(
-                detected_rotation + vis_upright.rotation_degrees
-            )
-            vis_upright.rotation_degrees = combined_rotation
-            vis.rotation_degrees = combined_rotation
-            match_upright = self._resolve_facility_match(item, vis_upright)
-            upright_better = (match is None and match_upright is not None) or (
-                match is not None
-                and match_upright is not None
-                and (
-                    (match.needs_review and not match_upright.needs_review)
-                    or (
-                        (not match_upright.needs_review or match.needs_review)
-                        and match_upright.score >= match.score
-                    )
+        if needs_upright_retry:
+            try:
+                vis_upright = self.vision.analyze_image(
+                    item.file_path,
+                    caption=item.caption,
+                    rotation_degrees=detected_rotation,
+                    reference_date=item.created_at,
                 )
-            )
-            if upright_better:
-                return vis_upright, match_upright
-        except Exception as exc:
-            log.warning(
-                "Повторний аналіз повернутого на %d° фото %s не вдався: %s",
-                detected_rotation,
-                item.file_path.name[:24],
-                exc,
-            )
+                self._normalize_report_flags(vis_upright)
+                # Додаємо залишковий кут після перевороту (наприклад, 270° + 180° -> 90° для горизонтальних ТТН)
+                combined_rotation = normalize_rotation_degrees(
+                    detected_rotation + vis_upright.rotation_degrees
+                )
+                vis_upright.rotation_degrees = combined_rotation
+                vis.rotation_degrees = combined_rotation
+                match_upright = self._resolve_facility_match(item, vis_upright)
+                if self._is_better_match(match, match_upright):
+                    vis, match = vis_upright, match_upright
+            except Exception as exc:
+                log.warning(
+                    "Повторний аналіз повернутого на %d° фото %s не вдався: %s",
+                    detected_rotation,
+                    item.file_path.name[:24],
+                    exc,
+                )
+
+        # Tier-2 ескалація на сильнішу Vision-модель лише для складних документів
+        # і тільки якщо в .env наявний API-ключ для хоча б одного іншого маршруту з escalation_routes
+        tier1_model = getattr(self.vision, "last_used_model", "")
+        exclude_models = {tier1_model} if tier1_model else set()
+        needs_escalation = (
+            self.vision.has_escalation_for(exclude_models)
+            and vis.is_report
+            and vis.document_type != "food_photo"
+            and (match is None or match.needs_review)
+        )
+        if needs_escalation:
+            tier1_route = self.vision.last_used_route
+            try:
+                esc_kwargs: dict = {
+                    "caption": item.caption,
+                    "rotation_degrees": vis.rotation_degrees,
+                    "reference_date": item.created_at,
+                    "escalate": True,
+                }
+                if exclude_models:
+                    esc_kwargs["exclude_models"] = exclude_models
+                vis_esc = self.vision.analyze_image(item.file_path, **esc_kwargs)
+                self._normalize_report_flags(vis_esc)
+                vis_esc.rotation_degrees = normalize_rotation_degrees(
+                    vis.rotation_degrees + vis_esc.rotation_degrees
+                )
+                if not vis_esc.is_report and match is None:
+                    log.info(
+                        "[ESCALATION] %s (%s): перекласифіковано як non-report (%s)",
+                        item.file_path.name[:24],
+                        self.vision.last_used_route,
+                        vis_esc.summary[:60],
+                    )
+                    return vis_esc, None
+
+                match_esc = self._resolve_facility_match(item, vis_esc)
+                if self._is_better_match(match, match_esc):
+                    log.info(
+                        "[ESCALATION] %s (%s): %s -> %s (score=%.2f, review=%s)",
+                        item.file_path.name[:24],
+                        self.vision.last_used_route,
+                        match.facility_id if match else "unmatched",
+                        match_esc.facility_id if match_esc else "unmatched",
+                        match_esc.score if match_esc else 0.0,
+                        match_esc.needs_review if match_esc else None,
+                    )
+                    return vis_esc, match_esc
+                self.vision.last_used_route = tier1_route
+            except Exception as exc:
+                self.vision.last_used_route = tier1_route
+                log.warning(
+                    "Ескалація фото %s на сильнішу модель не вдалася (залишаємо Tier-1): %s",
+                    item.file_path.name[:24],
+                    exc,
+                )
+
         return vis, match
 
     def _validate_item_date(self, item: IncomingMediaItem, vis: VisionAnalysisResult) -> None:

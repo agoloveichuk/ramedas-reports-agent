@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date
 import sys
 import time
 
+from src.alerts import strip_html_tags
 from src.config import Settings
 from src.logger import LOG_FILE, get_logger
 from src.models import IncomingMediaItem
@@ -16,6 +18,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Ramedas Reports Agent")
     parser.add_argument("--status", action="store_true", help="Показати поточний стан і чергу")
     parser.add_argument("--once", action="store_true", help="Обробити поточну чергу фото")
+    parser.add_argument(
+        "--all-history",
+        action="store_true",
+        help="Повний прогін по всій історії груп (без 72-год ліміту Telegram, розширене вікно дат 365 дн. і без видалення файлів)",
+    )
+    parser.add_argument(
+        "--no-rotate",
+        action="store_true",
+        help="Не виконувати автоматичну ротацію ViberDownloads після --once",
+    )
     parser.add_argument("--limit", type=int, default=0, help="Ліміт фото за один прогін")
     parser.add_argument("--dry-run", action="store_true", help="Тестовий прогін без запису")
     parser.add_argument("--watch", action="store_true", help="Фоновий моніторинг")
@@ -45,6 +57,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--test-alert",
         action="store_true",
         help="Надіслати тестовий технічний алерт (у Telegram або в локальний лог, якщо бот не підключений)",
+    )
+    parser.add_argument(
+        "--daily-summary",
+        action="store_true",
+        help="Сформувати і надіслати в Telegram підсумкову статистику дня (із --dry-run лише вивід у консоль)",
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        default=None,
+        help="Дата YYYY-MM-DD для --daily-summary (за замовчуванням сьогодні)",
     )
     parser.add_argument(
         "--telegram-login",
@@ -100,6 +123,7 @@ def _print_status(pipeline: ReportPipeline, settings: Settings, *, viber_alive: 
     stats = pipeline.storage.get_unfinished_stats()
     last_arrival = pipeline.storage.get_last_arrival_time()
     chain_str = " -> ".join(f"{p.name}[{p.model}]" for p in pipeline.vision.active_providers)
+    esc_str = " -> ".join(f"{p.name}[{p.model}]" for p in pipeline.vision.escalation_providers)
     retention_mode = (
         f"archive -> {settings.viber_archive_dir}" if settings.viber_archive_dir else "delete"
     )
@@ -122,11 +146,13 @@ def _print_status(pipeline: ReportPipeline, settings: Settings, *, viber_alive: 
         f"  work_hours       : {settings.work_hours_start}-{settings.work_hours_end} "
         f"(тиша > {settings.silence_alert_minutes} хв, cooldown {settings.alert_cooldown_minutes} хв)"
     )
+    print(f"  daily_summary    : {settings.daily_summary_time or 'disabled'}")
     print(
         "  last_arrival     : "
         f"{last_arrival.strftime('%Y-%m-%d %H:%M:%S') if last_arrival else 'none'}"
     )
     print(f"  llm_chain        : {chain_str or 'none'}")
+    print(f"  escalation_chain : {esc_str or 'disabled (no API key)'}")
     print(f"  routing_config   : {pipeline.vision.routing_path}")
     print(f"  review_threshold : {settings.confidence_review_threshold}")
     print(
@@ -157,13 +183,19 @@ def _process_batches(
 def _run_once(pipeline: ReportPipeline, args: argparse.Namespace) -> None:
     pending, batches = pipeline.fetch_pending_batches(limit=args.limit)
     log.info(
-        "Старт обробки черги: %d фото (%d пакетів), dry_run=%s",
+        "Старт обробки черги: %d фото (%d пакетів), dry_run=%s, all_history=%s",
         len(pending),
         len(batches),
         args.dry_run,
+        args.all_history,
     )
     _process_batches(pipeline, batches, dry_run=args.dry_run)
-    if args.limit == 0 or args.rotate_old:
+    should_rotate = (
+        not args.no_rotate
+        and (not args.all_history or args.rotate_old)
+        and (args.limit == 0 or args.rotate_old)
+    )
+    if should_rotate:
         pipeline.rotate_viber_downloads(
             retention_days=args.retention_days,
             dry_run=args.dry_run,
@@ -187,6 +219,7 @@ def _run_watch(
     )
     last_watchdog_ts = time.time()
     last_silence_ts = 0.0
+    last_summary_ts = 0.0
     last_rotate_ts = 0.0
     last_tg_poll_ts = 0.0
     try:
@@ -217,6 +250,14 @@ def _run_watch(
                 if newest_age >= settings.batch_window_seconds:
                     log.info("У черзі %d фото (%d пакетів)", len(pending), len(batches))
                     _process_batches(pipeline, batches, dry_run=args.dry_run)
+                    pending = []
+
+            if now_ts - last_summary_ts >= 60.0:
+                pipeline.monitor.check_daily_summary(
+                    viber_running=viber_alive,
+                    pending_count=len(pending),
+                )
+                last_summary_ts = now_ts
             time.sleep(5)
     except KeyboardInterrupt:
         log.info("Зупинено користувачем.")
@@ -228,6 +269,9 @@ def main() -> int:
 
     args = _build_parser().parse_args()
     settings = Settings()
+    if args.all_history:
+        settings.telegram_lookback_hours = 0
+        settings.document_date_max_age_days = max(settings.document_date_max_age_days, 365)
     pipeline = ReportPipeline(settings)
 
     if args.telegram_login:
@@ -252,20 +296,49 @@ def main() -> int:
         pipeline.monitor.emit_alert(
             "manual_test",
             "info",
-            f"[Ramedas] Тестове технічне сповіщення (Telegram={tg_state}).",
+            (
+                "✅ <b>Ramedas Alerts на зв'язку</b>\n"
+                f"Тестове технічне сповіщення (Telegram: <b>{tg_state}</b>)."
+            ),
             force=True,
         )
         return 0
 
+    if args.daily_summary:
+        try:
+            target_date = date.fromisoformat(args.date) if args.date else date.today()
+        except ValueError:
+            log.error("Некоректний формат --date %r (очікується YYYY-MM-DD)", args.date)
+            return 2
+        viber_alive = pipeline.watchdog.is_viber_running()
+        pending, _ = pipeline.fetch_pending_batches(include_telegram=False)
+        if args.dry_run:
+            stats = pipeline.storage.get_daily_summary(target_date)
+            msg = pipeline.monitor.format_daily_summary(
+                stats,
+                viber_running=viber_alive,
+                pending_count=len(pending),
+            )
+        else:
+            _, msg = pipeline.monitor.send_daily_summary(
+                target_date=target_date,
+                viber_running=viber_alive,
+                pending_count=len(pending),
+                manual=True,
+            )
+        print(strip_html_tags(msg))
+        return 0
+
     viber_alive = pipeline.watchdog.ensure_running()
-    has_action = args.once or args.watch or args.rotate_old
+    run_queue = args.once or args.all_history
+    has_action = run_queue or args.watch or args.rotate_old
 
     if args.status or not has_action:
         _print_status(pipeline, settings, viber_alive=viber_alive)
         if not has_action:
             return 0
 
-    if args.rotate_old and not (args.once or args.watch):
+    if args.rotate_old and not (run_queue or args.watch):
         rot_stats = pipeline.rotate_viber_downloads(
             retention_days=args.retention_days,
             dry_run=args.dry_run,
@@ -274,7 +347,7 @@ def main() -> int:
             log.info("Старих оброблених файлів у ViberDownloads для ротації не знайдено.")
         return 0
 
-    if args.once:
+    if run_queue:
         _run_once(pipeline, args)
     elif args.watch:
         _run_watch(pipeline, settings, args, viber_alive=viber_alive)

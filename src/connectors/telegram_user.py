@@ -123,7 +123,7 @@ class TelegramUserConnector(BaseConnector):
         self.session_path = session_path
         self.downloads_dir = downloads_dir
         self.is_processed_fn = is_processed_fn
-        self.lookback_hours = max(1, lookback_hours)
+        self.lookback_hours = max(0, lookback_hours)
         self.allowed_chats = allowed_chats
         self._client_factory = client_factory
         self._warned_no_session = False
@@ -177,7 +177,13 @@ class TelegramUserConnector(BaseConnector):
     async def _fetch_pending_async(self) -> list[IncomingMediaItem]:
         client = self._create_client()
         items: list[IncomingMediaItem] = []
-        cutoff_utc = datetime.now(timezone.utc) - timedelta(hours=self.lookback_hours)
+        # lookback_hours <= 0 означає повне вивантаження всієї історії чатів без часового ліміту
+        cutoff_utc = (
+            datetime.now(timezone.utc) - timedelta(hours=self.lookback_hours)
+            if self.lookback_hours > 0
+            else None
+        )
+        msg_limit = 250 if self.lookback_hours > 0 else None
 
         try:
             await client.connect()
@@ -201,9 +207,9 @@ class TelegramUserConnector(BaseConnector):
                 ):
                     continue
 
-                async for msg in client.iter_messages(dialog.entity, limit=250):
+                async for msg in client.iter_messages(dialog.entity, limit=msg_limit):
                     msg_dt = getattr(msg, "date", None)
-                    if msg_dt is not None:
+                    if cutoff_utc is not None and msg_dt is not None:
                         msg_utc = (
                             msg_dt.astimezone(timezone.utc)
                             if msg_dt.tzinfo

@@ -45,6 +45,18 @@ class CatalogAndPromptsTests(unittest.TestCase):
         self.assertEqual(m_gorodok.facility_id, "FAC-0104")
         self.assertFalse(m_gorodok.needs_review)
 
+        vis_gorodok_shkola = VisionAnalysisResult(
+            is_report=True,
+            document_type="waybill_external",
+            facility_hint="Городок Школа Рамадас",
+            legibility="clear",
+            confidence=0.88,
+        )
+        m_gorodok_shkola = self.catalog.match(vis_gorodok_shkola)
+        self.assertIsNotNone(m_gorodok_shkola)
+        self.assertEqual(m_gorodok_shkola.facility_id, "FAC-0104")
+        self.assertFalse(m_gorodok_shkola.needs_review)
+
         # Чіткий акт лише за назвою села без прізвища кухаря все ще вимагає підтвердження
         vis_act_only_village = VisionAnalysisResult(
             is_report=True,
@@ -93,6 +105,29 @@ class CatalogAndPromptsTests(unittest.TestCase):
         self.assertEqual(hit.facility_id, "FAC-TEST-1")
         self.assertIn("contact:нікітін", hit.match_reason)
 
+    def test_new_legal_entities_fops_and_novovolynsk_catalog(self) -> None:
+        # "Дженерал Девелопмент Україна" ігнорується як юрособа-оператор
+        vis_gd = VisionAnalysisResult(
+            is_report=True,
+            document_type="waybill_external",
+            facility_hint="ТОВ Дженерал Девелопмент Україна",
+            confidence=0.90,
+        )
+        self.assertIsNone(self.catalog.match(vis_gd))
+
+        # Ліцеї Нововолинська, додані з бази Z:\, тепер знаходяться
+        vis_nv = VisionAnalysisResult(
+            is_report=True,
+            document_type="act",
+            facility_hint="Нововолинський ліцей №4",
+            settlement_or_address_hint="м. Нововолинськ, бульвар Шевченка 12",
+            confidence=0.95,
+        )
+        hit_nv = self.catalog.match(vis_nv)
+        self.assertIsNotNone(hit_nv)
+        self.assertEqual(hit_nv.facility_id, "FAC-0388")
+        self.assertFalse(hit_nv.needs_review)
+
     def test_prompts_and_json_extraction(self) -> None:
         prompt = build_user_prompt("примітка", reference_date=datetime(2026, 11, 20, 10, 0))
         self.assertIn("2026-11-20", prompt)
@@ -101,6 +136,9 @@ class CatalogAndPromptsTests(unittest.TestCase):
         wrapped = '```json\n[{"is_report": true, "document_type": "act"}]\n```'
         parsed = extract_json_object(wrapped)
         self.assertEqual(parsed["document_type"], "act")
+
+        two_objects = '{"is_report": true, "document_type": "waybill_internal"}\n{"extra": 1}'
+        self.assertEqual(extract_json_object(two_objects)["document_type"], "waybill_internal")
 
 
 if __name__ == "__main__":

@@ -101,6 +101,8 @@ def _distinctive_tokens(norm_text: str) -> list[str]:
 
 
 def _extract_surname(full_name: str) -> str:
+    if re.match(r"^\s*фоп\b", full_name or "", flags=re.IGNORECASE):
+        return ""
     cleaned = re.sub(r"\(.*?\)", "", full_name or "").strip().lower()
     parts = [p for p in re.split(r"\s+", cleaned) if p and len(p) > 2]
     return parts[0] if parts else ""

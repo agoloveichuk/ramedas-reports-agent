@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import html
 from pathlib import Path
+import re
 from typing import Optional
 from dotenv import dotenv_values
 import httpx
@@ -16,6 +18,12 @@ from src.config import PROJECT_ROOT, Settings
 from src.logger import get_logger
 
 log = get_logger("alerts")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def strip_html_tags(text: str) -> str:
+    """Прибирає просту HTML-розмітку Telegram для локальних логів, консолі та SQLite."""
+    return html.unescape(_HTML_TAG_RE.sub("", text or ""))
 
 
 class TelegramNotifier:
@@ -58,28 +66,40 @@ class TelegramNotifier:
         self._reload_env_if_changed()
         return bool(self._bot_token and self._chat_id)
 
-    def send(self, text: str) -> bool:
+    def send(self, text: str, *, parse_mode: Optional[str] = "HTML") -> bool:
         """
-        Надсилає повідомлення у Telegram.
-        Повертає True лише якщо повідомлення реально доставлене через Telegram Bot API.
-        Якщо бот ще не підключений — логує повідомлення локально та повертає False.
+        Надсилає повідомлення у Telegram (за замовчуванням з HTML-форматуванням).
+        Якщо бот ще не підключений - логує повідомлення локально та повертає False.
+        При помилці парсингу HTML автоматично робить повторну спробу звичайним текстом.
         """
+        plain_text = strip_html_tags(text)
         self._reload_env_if_changed()
         if not (self._bot_token and self._chat_id):
-            log.warning("[ALERT][LOCAL-ONLY, бот не підключений] %s", text)
+            log.warning("[ALERT][LOCAL-ONLY, бот не підключений] %s", plain_text)
             return False
 
         endpoint = f"https://api.telegram.org/bot{self._bot_token}/sendMessage"
-        payload = {
+        payload: dict[str, object] = {
             "chat_id": self._chat_id,
             "text": text,
             "disable_web_page_preview": True,
         }
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+
         try:
             with httpx.Client(timeout=self.timeout_seconds) as client:
                 response = client.post(endpoint, json=payload)
+                if response.status_code == 400 and parse_mode:
+                    fallback_payload = {
+                        "chat_id": self._chat_id,
+                        "text": plain_text,
+                        "disable_web_page_preview": True,
+                    }
+                    response = client.post(endpoint, json=fallback_payload)
                 response.raise_for_status()
-            log.info("[ALERT][TELEGRAM-SENT] %s", text.splitlines()[0][:120])
+            first_line = plain_text.splitlines()[0][:120] if plain_text else ""
+            log.info("[ALERT][TELEGRAM-SENT] %s", first_line)
             return True
         except Exception as exc:
             log.error("[ALERT][TELEGRAM-ERROR] Не вдалося надіслати в Telegram: %s", exc)

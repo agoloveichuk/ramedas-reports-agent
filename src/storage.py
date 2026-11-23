@@ -42,8 +42,25 @@ IGNORED_SURNAMES = frozenset(
         "тов",
         "фоп",
         "рамедас",
+        "дженерал",
+        "девелопмент",
         "директор",
         "кухар",
+        # Внутрішні бухгалтери/операціоністи Рамедаса (з Органіграми, не кухарі шкіл)
+        "рачкінда",
+        "балаушко",
+        "ляшко",
+        "тихонюк",
+        "горайчук",
+        "клюєва",
+        "кучарська",
+        "антіпова",
+        "васькевич",
+        "велісейко",
+        "оласюк",
+        "ярощук",
+        "марковець",
+        "євтушок",
         # Поширені власні імена (щоб із "Світлана Ковальчук" чи "Анатолій Лашик" бралося саме прізвище)
         "олена",
         "тетяна",
@@ -135,6 +152,8 @@ def _normalize_stamp_number(stamp_number: Optional[str]) -> Optional[str]:
 
 
 def _extract_clean_surname(person_hint: str) -> str:
+    if re.match(r"^\s*фоп\b", person_hint or "", flags=re.IGNORECASE):
+        return ""
     cleaned = re.sub(r"\(.*?\)", "", person_hint or "").strip().lower()
     cleaned = cleaned.replace("’", "'").replace("`", "'")
     parts = [p.strip(".,;:\"'") for p in re.split(r"\s+", cleaned) if p]
@@ -690,6 +709,56 @@ class ReportStorage:
             "by_region": region_summary,
         }
 
+    def get_daily_summary(self, target_date: Optional[date] = None) -> dict:
+        """Повертає зведену статистику оброблених фото за конкретну дату (YYYY-MM-DD)."""
+        day_str = (target_date or date.today()).isoformat()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, document_type, facility_id, region,
+                       COALESCE(received_at, processed_at) AS ts
+                FROM processed_media
+                WHERE COALESCE(received_at, processed_at) LIKE ?
+                """,
+                (f"{day_str}%",),
+            ).fetchall()
+
+        status_counts: dict[str, int] = {}
+        doc_counts: dict[str, int] = {}
+        region_counts: dict[str, int] = {}
+        facilities: set[str] = set()
+        last_ts: Optional[str] = None
+
+        for status, doc_type, fac_id, region, ts in rows:
+            st = status or "unknown"
+            status_counts[st] = status_counts.get(st, 0) + 1
+            if ts and (last_ts is None or ts > last_ts):
+                last_ts = ts
+            if st == "matched":
+                if fac_id:
+                    facilities.add(fac_id)
+                if doc_type:
+                    doc_counts[doc_type] = doc_counts.get(doc_type, 0) + 1
+                if region:
+                    region_counts[region] = region_counts.get(region, 0) + 1
+
+        return {
+            "date": day_str,
+            "total": len(rows),
+            "matched": status_counts.get("matched", 0),
+            "needs_review": status_counts.get("needs_review", 0),
+            "unmatched": status_counts.get("unmatched", 0),
+            "ignored_non_report": status_counts.get("ignored_non_report", 0),
+            "duplicate": status_counts.get("duplicate", 0),
+            "failed": status_counts.get("failed", 0),
+            "processing": status_counts.get("processing", 0),
+            "unique_facilities": len(facilities),
+            "unique_regions": len(region_counts),
+            "doc_types": sorted(doc_counts.items(), key=lambda kv: (-kv[1], kv[0])),
+            "top_regions": sorted(region_counts.items(), key=lambda kv: (-kv[1], kv[0])),
+            "last_arrival": last_ts[:19] if last_ts else None,
+        }
+
     def lookup_stamp(self, stamp_number: Optional[str]) -> Optional[FacilityMatch]:
         num = _normalize_stamp_number(stamp_number)
         if not num:
@@ -825,21 +894,37 @@ class ReportStorage:
                 learned_now.append(surname)
         return learned_now
 
-    def get_learned_contacts_map(self) -> dict[str, list[str]]:
-        """Повертає словник {facility_id: [surname, ...]} для прізвищ, які не є наскрізними між >2 школами."""
+    def get_learned_contacts_map(
+        self,
+        *,
+        min_occurrences: int = 2,
+        max_age_days: int = 90,
+    ) -> dict[str, list[str]]:
+        """
+        Повертає словник {facility_id: [surname, ...]} для надійних прізвищ кухарів:
+        - зустрічались щонайменше min_occurrences разів (відсікає поодинокі опечатки/заміни);
+        - оновлювались протягом останніх max_age_days днів (захист при переході кухаря в іншу школу);
+        - не є наскрізними між >2 школами (відсікає водіїв/поширені прізвища).
+        """
+        cutoff_iso = (datetime.now() - timedelta(days=max(1, max_age_days))).isoformat(
+            timespec="seconds"
+        )
         with self._connect() as conn:
-            # Відсікаємо прізвища, які зустрічаються більш ніж у 2 закладах (водії/експедитори/поширені однофамільці)
             rows = conn.execute(
                 """
                 SELECT facility_id, surname
                 FROM learned_contacts
-                WHERE surname IN (
-                    SELECT surname
-                    FROM learned_contacts
-                    GROUP BY surname
-                    HAVING COUNT(DISTINCT facility_id) <= 2
-                )
-                """
+                WHERE occurrences >= ?
+                  AND updated_at >= ?
+                  AND surname IN (
+                      SELECT surname
+                      FROM learned_contacts
+                      WHERE updated_at >= ?
+                      GROUP BY surname
+                      HAVING COUNT(DISTINCT facility_id) <= 2
+                  )
+                """,
+                (max(1, min_occurrences), cutoff_iso, cutoff_iso),
             ).fetchall()
         result: dict[str, list[str]] = {}
         for fac_id, surname in rows:

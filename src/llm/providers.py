@@ -81,12 +81,24 @@ class GeminiVisionProvider(BaseVisionProvider):
             response.raise_for_status()
             data = response.json()
 
-        raw_text = (
+        parts = (
             data.get("candidates", [{}])[0]
             .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "{}")
+            .get("parts", [])
         )
+        non_thought_texts = [
+            p.get("text", "")
+            for p in parts
+            if isinstance(p, dict) and not p.get("thought") and p.get("text")
+        ]
+        if non_thought_texts:
+            raw_text = "\n".join(non_thought_texts)
+        else:
+            raw_text = (
+                parts[0].get("text", "{}")
+                if parts and isinstance(parts[0], dict)
+                else "{}"
+            )
         return VisionAnalysisResult.model_validate(extract_json_object(raw_text))
 
 
