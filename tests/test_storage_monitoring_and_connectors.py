@@ -921,6 +921,72 @@ class StorageMonitoringAndConnectorsTests(unittest.TestCase):
             conn.close()
             self.assertEqual(storage.get_learned_contacts_map(), {})
 
+    def test_openai_compatible_providers_openrouter_mistral_and_json_fallback(self) -> None:
+        from src.llm.providers import OpenAICompatibleVisionProvider, create_provider
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            img = _save_random_image(tmp_path / "doc.jpg")
+
+            # Перевіряємо фабрику провайдерів для mistral, openrouter, nvidia
+            for ptype, url in [
+                ("mistral", "https://api.mistral.ai/v1"),
+                ("openrouter", "https://openrouter.ai/api/v1"),
+                ("nvidia", "https://integrate.api.nvidia.com/v1"),
+            ]:
+                prov = create_provider(
+                    {
+                        "name": f"{ptype}_test",
+                        "provider": ptype,
+                        "model": "test-model",
+                        "base_url": url,
+                    },
+                    "key123",
+                )
+                self.assertIsInstance(prov, OpenAICompatibleVisionProvider)
+
+            # OpenRouter: додає рекомендовані заголовки і при HTTP 400 на response_format повторює без нього
+            or_prov = create_provider(
+                {
+                    "name": "openrouter_free",
+                    "provider": "openrouter",
+                    "model": "google/gemma-4-31b-it:free",
+                    "base_url": "https://openrouter.ai/api/v1",
+                },
+                "or_key",
+            )
+            calls: list[tuple[dict, dict]] = []
+            resp_400 = MagicMock()
+            resp_400.status_code = 400
+            resp_200 = MagicMock()
+            resp_200.status_code = 200
+            resp_200.raise_for_status.return_value = None
+            resp_200.json.return_value = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": '```json\n{"is_report": true, "document_type": "act", "confidence": 0.91}\n```'
+                        }
+                    }
+                ]
+            }
+
+            def fake_post(url, *, headers, json):
+                calls.append((dict(headers), dict(json)))
+                return resp_400 if len(calls) == 1 else resp_200
+
+            with patch("src.llm.providers.httpx.Client") as mock_client_cls:
+                mock_client = mock_client_cls.return_value.__enter__.return_value
+                mock_client.post.side_effect = fake_post
+                vis = or_prov.analyze(img, "sys prompt")
+
+            self.assertEqual(len(calls), 2)
+            self.assertIn("X-Title", calls[0][0])
+            self.assertIn("response_format", calls[0][1])
+            self.assertNotIn("response_format", calls[1][1])
+            self.assertEqual(vis.document_type, "act")
+            self.assertAlmostEqual(vis.confidence, 0.91)
+
 
 if __name__ == "__main__":
     unittest.main()

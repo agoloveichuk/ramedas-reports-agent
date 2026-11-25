@@ -103,7 +103,11 @@ class GeminiVisionProvider(BaseVisionProvider):
 
 
 class OpenAICompatibleVisionProvider(BaseVisionProvider):
-    """Підходить для OpenAI, OpenRouter, Groq, локальних Ollama / vLLM (/v1/chat/completions)."""
+    """Підходить для OpenAI, OpenRouter, Mistral, NVIDIA NIM, Groq, Ollama / vLLM (/v1/chat/completions)."""
+
+    def __init__(self, *, supports_json_mode: bool = True, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.supports_json_mode = supports_json_mode
 
     def analyze(
         self,
@@ -127,10 +131,13 @@ class OpenAICompatibleVisionProvider(BaseVisionProvider):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
+        if self.provider_type == "openrouter" or "openrouter.ai" in base:
+            headers["HTTP-Referer"] = "https://github.com/agoloveichuk/ramedas-reports-agent"
+            headers["X-Title"] = "Ramedas Reports Agent"
+
+        payload: dict = {
             "model": self.model,
             "temperature": 0.1,
-            "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {
@@ -142,13 +149,26 @@ class OpenAICompatibleVisionProvider(BaseVisionProvider):
                 },
             ],
         }
+        if self.supports_json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(endpoint, headers=headers, json=payload)
+            if response.status_code == 400 and "response_format" in payload:
+                payload.pop("response_format", None)
+                response = client.post(endpoint, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
 
-        raw_text = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        if isinstance(content, list):
+            raw_text = "\n".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("text")
+            ) or "{}"
+        else:
+            raw_text = content or "{}"
         return VisionAnalysisResult.model_validate(extract_json_object(raw_text))
 
 
@@ -219,8 +239,21 @@ def create_provider(route_cfg: dict, api_key: str) -> BaseVisionProvider:
 
     if provider_type == "gemini":
         return GeminiVisionProvider(**kwargs)
-    if provider_type in ("openai", "openrouter", "openai_compatible", "ollama", "vllm"):
-        return OpenAICompatibleVisionProvider(**kwargs)
+    if provider_type in (
+        "openai",
+        "openrouter",
+        "mistral",
+        "nvidia",
+        "zai",
+        "groq",
+        "openai_compatible",
+        "ollama",
+        "vllm",
+    ):
+        return OpenAICompatibleVisionProvider(
+            supports_json_mode=bool(route_cfg.get("supports_json_mode", True)),
+            **kwargs,
+        )
     if provider_type == "anthropic":
         return AnthropicVisionProvider(**kwargs)
 

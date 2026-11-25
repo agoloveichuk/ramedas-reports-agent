@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import date
+from pathlib import Path
 import sys
 import time
 
 from src.alerts import strip_html_tags
 from src.config import Settings
+from src.llm.router import _sanitize_error_text
 from src.logger import LOG_FILE, get_logger
 from src.models import IncomingMediaItem
 from src.pipeline import ReportPipeline
@@ -78,6 +80,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--telegram-chats",
         action="store_true",
         help="Показати список груп Telegram та їхні ID (для TELEGRAM_ALLOWED_CHATS)",
+    )
+    parser.add_argument(
+        "--test-models",
+        action="store_true",
+        help="Порівняльний read-only тест усіх активних LLM-провайдерів із .env на реальних фото (без запису в БД)",
+    )
+    parser.add_argument(
+        "--sample",
+        type=str,
+        default=None,
+        help="Шлях до конкретного фото для --test-models",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=3,
+        help="Кількість тестових фото для --test-models (за замовчуванням 3)",
     )
     return parser
 
@@ -263,6 +282,109 @@ def _run_watch(
         log.info("Зупинено користувачем.")
 
 
+def _pick_sample_images(pipeline: ReportPipeline, settings: Settings, max_samples: int) -> list[Path]:
+    picked: list[Path] = []
+    seen: set[Path] = set()
+    reports_dir = pipeline.storage.reports_dir
+    if reports_dir.exists():
+        all_imgs = [
+            p for p in reports_dir.rglob("*")
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+        ]
+        # Намагаємося взяти по одному типовому документу кожного класу (ТТН, Щоденний звіт, Розрахунок сировини)
+        for token in ("_ТТН_", "_Щоденний_звіт_", "_Розрахунок_сировини_", "_Акт_", "_Меню_"):
+            for p in all_imgs:
+                if token in p.name and p not in seen:
+                    picked.append(p)
+                    seen.add(p)
+                    break
+            if len(picked) >= max_samples:
+                return picked
+        for p in all_imgs:
+            if p not in seen:
+                picked.append(p)
+                seen.add(p)
+            if len(picked) >= max_samples:
+                return picked
+
+    if len(picked) < max_samples and settings.viber_downloads_dir.exists():
+        for p in settings.viber_downloads_dir.iterdir():
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") and p not in seen:
+                picked.append(p)
+                seen.add(p)
+            if len(picked) >= max_samples:
+                break
+    return picked
+
+
+def _run_test_models(
+    pipeline: ReportPipeline,
+    settings: Settings,
+    *,
+    sample_path: str | None,
+    max_samples: int,
+) -> int:
+    providers = []
+    seen_keys: set[tuple[str, str]] = set()
+    for prov in list(pipeline.vision.active_providers) + list(pipeline.vision.escalation_providers):
+        key = (prov.provider_type, prov.model)
+        if key not in seen_keys:
+            seen_keys.add(key)
+            providers.append(prov)
+
+    if not providers:
+        print("Не знайдено жодного активного LLM-маршруту з ключем у .env.")
+        return 1
+
+    if sample_path:
+        p = Path(sample_path)
+        if not p.exists():
+            print(f"Файл не знайдено: {p}")
+            return 2
+        samples = [p]
+    else:
+        samples = _pick_sample_images(pipeline, settings, max(1, max_samples))
+
+    if not samples:
+        print("Не знайдено жодного фото для тестування (передайте --sample PATH).")
+        return 2
+
+    print(f"Тестування {len(providers)} активних моделей на {len(samples)} фото (read-only, без запису в БД):")
+    for prov in providers:
+        print(f"  - {prov.name} [{prov.provider_type}:{prov.model}]")
+
+    for idx, img_path in enumerate(samples, 1):
+        folder_hint = img_path.parent.parent.parent.name if len(img_path.parents) >= 3 else img_path.parent.name
+        print(f"\n[{idx}/{len(samples)}] {img_path.name} (папка: {folder_hint})")
+        for prov in providers:
+            t0 = time.monotonic()
+            try:
+                vis = prov.analyze(img_path, pipeline.vision.system_prompt)
+                pipeline._normalize_report_flags(vis)
+                match = pipeline.catalog.match(vis) if vis.is_report else None
+                ms = int((time.monotonic() - t0) * 1000)
+                if not vis.is_report:
+                    res_str = f"NON_REPORT ({vis.document_type})"
+                elif match:
+                    flag = " [REVIEW]" if match.needs_review else ""
+                    res_str = f"{match.facility_id} score={match.score:.2f}{flag} ({match.canonical_name[:30]})"
+                else:
+                    res_str = f"UNMATCHED (hint={vis.facility_hint!r})"
+                print(
+                    f"  OK  | {prov.name:27s} | {ms:5d}ms | leg={vis.legibility:6s} "
+                    f"conf={vis.confidence:.2f} rot={vis.rotation_degrees:3d} | {res_str}",
+                    flush=True,
+                )
+            except Exception as exc:
+                ms = int((time.monotonic() - t0) * 1000)
+                safe_err = _sanitize_error_text(str(exc)).replace("\n", " ")[:120]
+                print(
+                    f"  ERR | {prov.name:27s} | {ms:5d}ms | {exc.__class__.__name__}: {safe_err}",
+                    flush=True,
+                )
+    return 0
+
+
 def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -290,6 +412,14 @@ def main() -> int:
     if args.activity_stats:
         _print_activity_stats(pipeline, settings, args.days)
         return 0
+
+    if args.test_models:
+        return _run_test_models(
+            pipeline,
+            settings,
+            sample_path=args.sample,
+            max_samples=args.samples,
+        )
 
     if args.test_alert:
         tg_state = "підключений" if pipeline.notifier.is_configured else "ще не налаштований, запис локально"

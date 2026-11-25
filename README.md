@@ -144,7 +144,8 @@
 ### Основні параметри `.env`
 | Змінна | За замовчуванням | Опис |
 | --- | --- | --- |
-| `GEMINI_API_KEY` | - | Обов'язковий ключ Google AI Studio для базової Vision-цепочки |
+| `GEMINI_API_KEY` | - | Ключ Google AI Studio для базової Vision-цепочки (у проді - платний Pay-as-you-go) |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | порожньо | Опційні резервні провайдери (`gpt-6-luna` + `gpt-4.1`, Claude) - активуються лише якщо ключ заданий |
 | `VIBER_DOWNLOADS_DIR` | автопошук | Папка `ViberDownloads` локального клієнта Viber |
 | `REPORTS_OUTPUT_DIR` | локально `./storage/reports` | Цільова папка для `Щоденні документи/` (для сервера: `\\ramedas.local\Public`) |
 | `DOCUMENT_DATE_MAX_AGE_DAYS` | `14` | Скільки днів назад дата з бланка вважається валідною |
@@ -191,7 +192,10 @@
 .\.venv\Scripts\python.exe -m src.main --telegram-login
 .\.venv\Scripts\python.exe -m src.main --telegram-chats
 
-# 8. Автотести та перевірка синтаксису
+# 8. Порівняльний read-only тест усіх активних моделей із .env (без запису в БД)
+.\.venv\Scripts\python.exe -m src.main --test-models --samples 3
+
+# 9. Автотести та перевірка синтаксису
 .\.venv\Scripts\python.exe -m compileall -q src tests
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
